@@ -25,6 +25,7 @@ license: MIT
 ## Commands
 ```bash
 python dashboard.py                                             # dashboard
+python dashboard.py record coding --from-response run.json      # real API counts
 python dashboard.py record coding --input 12000 --output 800 --tier knife
 python dashboard.py record --input 4000 --output 300 --local llama3.2:1b --desc "summarize diff"
 python dashboard.py summary --json                              # machine-readable
@@ -32,10 +33,22 @@ python dashboard.py where                                       # ledger path
 ```
 
 Omit the task class and it is inferred from `--desc`. Pass `--cached N` for prompt-cache
-hits, `--failed` for runs that did not land.
+hits, `--failed` for runs that did not land, `--from-response -` to read from stdin.
+
+## Actual vs estimated usage
+`record_from_response(response)` reads the counts xAI actually reported — `prompt_tokens`,
+`completion_tokens`, `prompt_tokens_details.cached_tokens`,
+`completion_tokens_details.reasoning_tokens` — plus the exact price from
+`cost_in_usd_ticks`. Both the Chat Completions and Responses API shapes are handled, as SDK
+objects or parsed JSON.
+
+`record_run(...)` records whatever numbers it is given and estimates cost from list pricing.
+Every entry carries `cost_source` (`api` or `estimate`) so the two are never confused.
 
 ## Pricing (Grok, approx current)
-`grok-build-0.1`: ~$1/M input, $2/M output, cached input at ~$0.25/M. Used for estimates only.
+Used only when the API reports no cost. `grok-build-0.1`: ~$1/M input, $2/M output, cached
+input at ~$0.25/M. Reasoning tokens bill at the output rate and are already counted in
+output.
 
 ## Ledger
 `$HERMES_HOME/profiles/$HERMES_PROFILE/token_ledger.jsonl`, one JSON object per run.

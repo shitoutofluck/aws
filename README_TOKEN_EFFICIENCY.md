@@ -20,6 +20,7 @@ the tests.
 
 ```bash
 python dashboard.py                                              # dashboard
+python dashboard.py record coding --from-response run.json       # real API counts
 python dashboard.py record coding --input 12000 --output 800 --tier knife
 python dashboard.py record --input 4000 --output 300 --local llama3.2:1b --desc "summarize diff"
 python dashboard.py summary --json
@@ -27,17 +28,43 @@ python dashboard.py where
 ```
 
 Omitting the task class infers it from `--desc`. Add `--cached N` for prompt-cache hits and
-`--failed` for runs that did not land.
+`--failed` for runs that did not land. `--from-response -` reads the JSON from stdin.
 
 From Python:
 
 ```python
-from token_efficiency import record_run, show_dashboard, summarize, load_ledger
+from token_efficiency import record_run, record_from_response, show_dashboard
 
-record_run("coding", input_t=12_000, output_t=800, cached=6_000, tier="knife")
-stats = summarize(load_ledger())
+response = client.chat.completions.create(model="grok-4.6", messages=messages)
+record_from_response(response, "coding", tier="knife", task_desc="fix parser")
+
+record_run("coding", input_t=12_000, output_t=800, cached=6_000)  # manual estimate
 show_dashboard()
 ```
+
+## Where the numbers come from
+
+There are two paths, and the ledger records which one each run used in `cost_source`:
+
+- **`record_from_response(response)` — actual usage.** Reads the counts xAI reports and, when
+  present, the exact price xAI charged. This is the accurate path.
+- **`record_run(...)` — self-reported.** Records whatever numbers you hand it and estimates
+  cost from list pricing. Use it for local Ollama runs and for anything not made through the
+  API.
+
+`extract_usage` handles both xAI response shapes, either as SDK objects or parsed JSON:
+
+| | Chat Completions | Responses API |
+| --- | --- | --- |
+| Input | `usage.prompt_tokens` | `usage.input_tokens` |
+| Output | `usage.completion_tokens` | `usage.output_tokens` |
+| Cached | `usage.prompt_tokens_details.cached_tokens` | `usage.input_tokens_details.cached_tokens` |
+| Reasoning | `usage.completion_tokens_details.reasoning_tokens` | `usage.output_tokens_details.reasoning_tokens` |
+| Cost | `usage.cost_in_usd_ticks` | `cost_in_usd_ticks` / `cost_in_nano_usd` |
+
+Reasoning tokens are already inside the output count and bill at the output rate; they are
+tracked separately so that invisible spend is visible. The dashboard labels the cost line
+`provider-reported` when every Grok run came from the API, and otherwise says how many did.
 
 ## Context tiers
 
@@ -52,9 +79,14 @@ The dashboard reports `knife_share` so tier drift is visible before the bill is.
 
 ## Cost model
 
-Grok `grok-build-0.1` list pricing: $1/M input, $2/M output, cached input at $0.25/M. Cached
-tokens are treated as a subset of input, so they bill at the discounted rate rather than
-being counted twice.
+When the API reports a cost it is used verbatim. xAI returns `cost_in_usd_ticks`, an integer
+where 1e8 ticks is one cent and 1e10 ticks is one dollar; the Responses API may instead
+return `cost_in_nano_usd`. Either way the recorded figure is what you were actually charged,
+so it stays correct across model and price changes.
+
+Only when no cost is reported does the estimator run, using Grok `grok-build-0.1` list
+pricing: $1/M input, $2/M output, cached input at $0.25/M. Cached tokens are treated as a
+subset of input, so they bill at the discounted rate rather than being counted twice.
 
 A run recorded with `--local MODEL` was served by Ollama. Its `billed_cost` is zero and
 `avoided_cost` holds what the same run would have cost on Grok, so the "savings" figure is
@@ -84,15 +116,18 @@ a warning on stderr.
   "output": 800,
   "total": 12800,
   "cached": 6000,
+  "reasoning": 1204,
   "success": true,
   "task_desc": "fix parser bug",
   "tier": "knife",
+  "model": "grok-4.6",
   "local_optimized": false,
   "local_model": "",
   "turns": 1,
   "billed_cost": 0.0085,
   "avoided_cost": 0.0,
   "est_cost": 0.0085,
+  "cost_source": "api",
   "i_o_ratio": 15.0,
   "cache_hit_rate": 0.5
 }

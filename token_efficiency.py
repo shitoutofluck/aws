@@ -31,12 +31,15 @@ __all__ = [
     "TASK_CLASSES",
     "TIERS",
     "Pricing",
+    "UsageSnapshot",
     "classify_task",
     "estimate_cost",
+    "extract_usage",
     "format_dashboard",
     "hermes_home",
     "ledger_path",
     "load_ledger",
+    "record_from_response",
     "record_run",
     "show_dashboard",
     "summarize",
@@ -53,7 +56,12 @@ class Pricing:
 
 
 # grok-build-0.1 list pricing; cached input bills at a quarter of fresh input.
+# Only used when the API does not report a cost of its own.
 GROK_PRICING = Pricing(input_per_m=1.0, output_per_m=2.0, cached_input_per_m=0.25)
+
+# xAI reports cost as integer "ticks": 1e8 ticks per US cent, so 1e10 per dollar.
+TICKS_PER_USD = 1e10
+NANO_USD_PER_USD = 1e9
 
 TASK_CLASSES = ("coding", "research", "tool-heavy", "short-chat", "long-horizon")
 
@@ -123,6 +131,106 @@ def estimate_cost(
     return round(cost, 6)
 
 
+@dataclass(frozen=True)
+class UsageSnapshot:
+    """Token counts read straight off an API response."""
+
+    input: int
+    output: int
+    total: int
+    cached: int = 0
+    reasoning: int = 0
+    # Cost as reported by the provider, in USD. None means it wasn't reported
+    # and callers should fall back to estimating from list pricing.
+    cost_usd: Optional[float] = None
+    model: str = ""
+
+
+def _field(obj: Any, name: str, default: Any = None) -> Any:
+    """Read ``name`` from a dict or an SDK object, treating None as absent."""
+    if obj is None:
+        return default
+    value = obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
+    return default if value is None else value
+
+
+def extract_usage(response: Any) -> UsageSnapshot:
+    """Pull real token counts out of an xAI/OpenAI-compatible response.
+
+    Accepts an SDK response object, a parsed JSON dict, or a bare ``usage``
+    object, in either the Chat Completions shape (``prompt_tokens`` /
+    ``completion_tokens``) or the Responses API shape (``input_tokens`` /
+    ``output_tokens``).
+    """
+    usage = _field(response, "usage", response)
+
+    if _field(usage, "prompt_tokens") is not None:
+        input_t = int(_field(usage, "prompt_tokens", 0))
+        output_t = int(_field(usage, "completion_tokens", 0))
+        in_details = _field(usage, "prompt_tokens_details")
+        out_details = _field(usage, "completion_tokens_details")
+    elif _field(usage, "input_tokens") is not None:
+        input_t = int(_field(usage, "input_tokens", 0))
+        output_t = int(_field(usage, "output_tokens", 0))
+        in_details = _field(usage, "input_tokens_details")
+        out_details = _field(usage, "output_tokens_details")
+    else:
+        raise ValueError("response carries no usage block with token counts")
+
+    ticks = _field(usage, "cost_in_usd_ticks")
+    nano = _field(usage, "cost_in_nano_usd")
+    if ticks is not None:
+        cost_usd: Optional[float] = round(int(ticks) / TICKS_PER_USD, 10)
+    elif nano is not None:
+        cost_usd = round(int(nano) / NANO_USD_PER_USD, 10)
+    else:
+        cost_usd = None
+
+    return UsageSnapshot(
+        input=input_t,
+        output=output_t,
+        total=int(_field(usage, "total_tokens", input_t + output_t)),
+        cached=int(_field(in_details, "cached_tokens", 0)),
+        # Reasoning tokens bill as output and are already inside output_t;
+        # tracked separately so invisible spend is visible.
+        reasoning=int(_field(out_details, "reasoning_tokens", 0)),
+        cost_usd=cost_usd,
+        model=str(_field(response, "model", "")),
+    )
+
+
+def record_from_response(
+    response: Any,
+    task_class: Optional[str] = None,
+    task_desc: str = "",
+    tier: str = "knife",
+    success: bool = True,
+    turns: int = 1,
+    profile: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Record a run using the real token counts and cost from an API response.
+
+    This is the accurate path: counts come from the provider rather than from
+    an estimate, and the cost xAI reports is used verbatim when present.
+    """
+    usage = extract_usage(response)
+    return record_run(
+        task_class or classify_task(task_desc),
+        input_t=usage.input,
+        output_t=usage.output,
+        total_t=usage.total,
+        cached=usage.cached,
+        reasoning_t=usage.reasoning,
+        actual_cost=usage.cost_usd,
+        success=success,
+        task_desc=task_desc,
+        tier=tier,
+        turns=turns,
+        model=usage.model,
+        profile=profile,
+    )
+
+
 def record_run(
     task_class: str,
     input_t: int,
@@ -135,9 +243,15 @@ def record_run(
     local_optimized: bool = False,
     local_model: str = "",
     turns: int = 1,
+    reasoning_t: int = 0,
+    actual_cost: Optional[float] = None,
+    model: str = "",
     profile: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Append one run to the ledger and return the recorded entry.
+
+    ``actual_cost`` is the provider-reported price in USD; when it is None the
+    cost is estimated from list pricing, and ``cost_source`` records which.
 
     A run with ``local_optimized=True`` was served by a local model, so it costs
     nothing but still carries a Grok-equivalent price: that difference is the
@@ -149,7 +263,10 @@ def record_run(
         raise ValueError(f"tier must be one of {TIERS}, got {tier!r}")
 
     total_t = input_t + output_t if total_t is None else total_t
-    grok_cost = estimate_cost(input_t, output_t, cached)
+    metered = actual_cost is not None and not local_optimized
+    grok_cost = float(actual_cost) if actual_cost is not None else estimate_cost(
+        input_t, output_t, cached
+    )
 
     entry: Dict[str, Any] = {
         "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -158,15 +275,18 @@ def record_run(
         "output": output_t,
         "total": total_t,
         "cached": cached,
+        "reasoning": reasoning_t,
         "success": success,
         "task_desc": task_desc[:200],
         "tier": tier,
+        "model": local_model if local_optimized else model,
         "local_optimized": local_optimized,
         "local_model": local_model if local_optimized else "",
         "turns": turns,
         "billed_cost": 0.0 if local_optimized else grok_cost,
         "avoided_cost": grok_cost if local_optimized else 0.0,
         "est_cost": grok_cost,
+        "cost_source": "api" if metered else "estimate",
         "i_o_ratio": round(input_t / max(1, output_t), 2),
         "cache_hit_rate": round(cached / max(1, input_t), 4),
     }
@@ -236,8 +356,10 @@ def summarize(runs: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
             "input": 0,
             "output": 0,
             "cached": 0,
+            "reasoning": 0,
             "billed_cost": 0.0,
             "avoided_cost": 0.0,
+            "metered_runs": 0,
             "cache_hit_rate": 0.0,
             "avg_tokens_per_task": 0.0,
             "i_o_ratio": 0.0,
@@ -251,6 +373,7 @@ def summarize(runs: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
     input_t = sum(int(r.get("input", 0)) for r in runs)
     output_t = sum(int(r.get("output", 0)) for r in runs)
     cached = sum(int(r.get("cached", 0)) for r in runs)
+    reasoning = sum(int(r.get("reasoning", 0)) for r in runs)
     total = sum(int(r.get("total", 0)) for r in runs)
     local = [r for r in runs if r.get("local_optimized")]
     knife = [r for r in runs if r.get("tier") == "knife"]
@@ -261,8 +384,10 @@ def summarize(runs: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
         "input": input_t,
         "output": output_t,
         "cached": cached,
+        "reasoning": reasoning,
         "billed_cost": round(sum(_billed(r) for r in runs), 6),
         "avoided_cost": round(sum(_avoided(r) for r in runs), 6),
+        "metered_runs": sum(1 for r in runs if r.get("cost_source") == "api"),
         "cache_hit_rate": round(cached / max(1, input_t), 4),
         "avg_tokens_per_task": round(total / len(runs), 1),
         "i_o_ratio": round(input_t / max(1, output_t), 2),
@@ -302,16 +427,25 @@ def format_dashboard(runs: Sequence[Dict[str, Any]], recent: int = 10) -> str:
         ]
         return "\n".join(lines)
 
+    grok_runs = sum(1 for r in runs if not r.get("local_optimized"))
+    metered = stats["metered_runs"]
+    provenance = (
+        "provider-reported"
+        if metered == grok_runs and grok_runs
+        else f"{metered}/{grok_runs} from API, rest estimated"
+    )
+
     lines += [
         "",
         "Cumulative",
         f"  Tokens          : {stats['tokens']:,} "
         f"(in {stats['input']:,} / out {stats['output']:,})",
+        f"  Reasoning       : {stats['reasoning']:,} (billed as output)",
         f"  Avg per task    : {stats['avg_tokens_per_task']:,.1f}",
         f"  I:O ratio       : {stats['i_o_ratio']:.2f}",
         f"  Cache hit rate  : {stats['cache_hit_rate']:.1%}",
         f"  Success rate    : {stats['success_rate']:.1%}",
-        f"  Billed (Grok)   : ${stats['billed_cost']:.4f}",
+        f"  Billed (Grok)   : ${stats['billed_cost']:.4f} ({provenance})",
         f"  Avoided (local) : ${stats['avoided_cost']:.4f}",
         f"  Knife share     : {stats['knife_share']:.1%}",
         f"  Local share     : {stats['local_share']:.1%}",

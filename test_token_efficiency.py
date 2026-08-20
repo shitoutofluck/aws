@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 
 import pytest
@@ -158,6 +159,164 @@ def test_format_dashboard_reports_tiers_and_local_model():
     assert "nuke" in output
     assert "llama3.2:1b" in output
     assert "Local share     : 50.0%" in output
+
+
+CHAT_RESPONSE = {
+    "model": "grok-4.6",
+    "usage": {
+        "prompt_tokens": 125,
+        "completion_tokens": 48,
+        "total_tokens": 173,
+        "prompt_tokens_details": {"text_tokens": 125, "cached_tokens": 98},
+        "completion_tokens_details": {"reasoning_tokens": 30},
+        "cost_in_usd_ticks": 12_345_678_900,
+    },
+}
+
+RESPONSES_API_RESPONSE = {
+    "model": "grok-4.6",
+    "usage": {
+        "input_tokens": 125,
+        "output_tokens": 48,
+        "total_tokens": 173,
+        "input_tokens_details": {"cached_tokens": 98},
+        "output_tokens_details": {"reasoning_tokens": 30},
+        "cost_in_nano_usd": 1_500_000_000,
+    },
+}
+
+
+class _Details:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
+class _SdkResponse:
+    """Stand-in for an SDK object exposing usage as attributes."""
+
+    def __init__(self):
+        self.model = "grok-4.6"
+        self.usage = _Details(
+            prompt_tokens=125,
+            completion_tokens=48,
+            total_tokens=173,
+            prompt_tokens_details=_Details(cached_tokens=98),
+            completion_tokens_details=_Details(reasoning_tokens=30),
+            cost_in_usd_ticks=12_345_678_900,
+        )
+
+
+def test_extract_usage_from_chat_completions_shape():
+    usage = te.extract_usage(CHAT_RESPONSE)
+
+    assert (usage.input, usage.output, usage.total) == (125, 48, 173)
+    assert usage.cached == 98
+    assert usage.reasoning == 30
+    assert usage.cost_usd == pytest.approx(1.23456789)
+    assert usage.model == "grok-4.6"
+
+
+def test_extract_usage_from_responses_api_shape():
+    usage = te.extract_usage(RESPONSES_API_RESPONSE)
+
+    assert (usage.input, usage.output, usage.total) == (125, 48, 173)
+    assert usage.cached == 98
+    assert usage.reasoning == 30
+    assert usage.cost_usd == pytest.approx(1.5)
+
+
+def test_extract_usage_from_sdk_object():
+    assert te.extract_usage(_SdkResponse()) == te.extract_usage(CHAT_RESPONSE)
+
+
+def test_extract_usage_accepts_bare_usage_block():
+    assert te.extract_usage(CHAT_RESPONSE["usage"]).input == 125
+
+
+def test_extract_usage_without_reported_cost():
+    usage = te.extract_usage({"usage": {"prompt_tokens": 10, "completion_tokens": 2}})
+
+    assert usage.cost_usd is None
+    assert usage.total == 12
+
+
+def test_extract_usage_rejects_response_without_usage():
+    with pytest.raises(ValueError):
+        te.extract_usage({"choices": []})
+
+
+def test_record_from_response_uses_reported_cost():
+    entry = te.record_from_response(CHAT_RESPONSE, "coding", tier="knife")
+
+    assert entry["input"] == 125
+    assert entry["cached"] == 98
+    assert entry["reasoning"] == 30
+    assert entry["cost_source"] == "api"
+    assert entry["billed_cost"] == pytest.approx(1.23456789)
+    assert entry["model"] == "grok-4.6"
+
+
+def test_record_from_response_falls_back_to_estimate():
+    entry = te.record_from_response({"usage": {"prompt_tokens": 1_000_000, "completion_tokens": 0}})
+
+    assert entry["cost_source"] == "estimate"
+    assert entry["billed_cost"] == pytest.approx(1.0)
+
+
+def test_record_from_response_classifies_from_description():
+    entry = te.record_from_response(CHAT_RESPONSE, task_desc="refactor the tokenizer")
+    assert entry["class"] == "coding"
+
+
+def test_manual_records_are_marked_as_estimates():
+    entry = te.record_run("coding", 100, 10)
+    assert entry["cost_source"] == "estimate"
+
+
+def test_summary_counts_metered_runs():
+    te.record_from_response(CHAT_RESPONSE, "coding")
+    te.record_run("coding", 100, 10)
+
+    stats = te.summarize(te.load_ledger())
+
+    assert stats["metered_runs"] == 1
+    assert stats["reasoning"] == 30
+
+
+def test_dashboard_flags_mixed_cost_provenance():
+    te.record_from_response(CHAT_RESPONSE, "coding")
+    te.record_run("coding", 100, 10)
+
+    assert "1/2 from API, rest estimated" in te.format_dashboard(te.load_ledger())
+
+
+def test_dashboard_flags_fully_metered_costs():
+    te.record_from_response(CHAT_RESPONSE, "coding")
+
+    assert "(provider-reported)" in te.format_dashboard(te.load_ledger())
+
+
+def test_cli_record_from_response_file(tmp_path, capsys):
+    path = tmp_path / "response.json"
+    path.write_text(json.dumps(CHAT_RESPONSE), encoding="utf-8")
+
+    assert dashboard.main(["record", "coding", "--from-response", str(path)]) == 0
+    entry = json.loads(capsys.readouterr().out)
+
+    assert entry["input"] == 125
+    assert entry["cost_source"] == "api"
+
+
+def test_cli_record_from_response_stdin(monkeypatch, capsys):
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(CHAT_RESPONSE)))
+
+    assert dashboard.main(["record", "coding", "--from-response", "-"]) == 0
+    assert json.loads(capsys.readouterr().out)["cached"] == 98
+
+
+def test_cli_record_requires_tokens_without_response(capsys):
+    assert dashboard.main(["record", "coding"]) == 2
+    assert "--input and --output are required" in capsys.readouterr().err
 
 
 def test_cli_record_then_summary(capsys):

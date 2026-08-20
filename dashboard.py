@@ -3,6 +3,7 @@
 
     python dashboard.py                                  # live dashboard
     python dashboard.py record coding --input 12000 --output 800
+    python dashboard.py record coding --from-response run.json   # real API counts
     python dashboard.py summary --json                   # machine-readable
     python dashboard.py where                            # ledger location
 """
@@ -20,9 +21,15 @@ from token_efficiency import (
     format_dashboard,
     ledger_path,
     load_ledger,
+    record_from_response,
     record_run,
     summarize,
 )
+
+
+def _read(path: str) -> str:
+    with open(path, encoding="utf-8") as handle:
+        return handle.read()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -39,8 +46,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     rec = sub.add_parser("record", help="append a run to the ledger")
     rec.add_argument("task_class", nargs="?", help="coding, research, tool-heavy, ...")
-    rec.add_argument("--input", "-i", type=int, required=True, dest="input_t")
-    rec.add_argument("--output", "-o", type=int, required=True, dest="output_t")
+    rec.add_argument("--from-response", dest="from_response", metavar="FILE",
+                     help="read real token counts from a saved API response JSON ('-' for stdin)")
+    rec.add_argument("--input", "-i", type=int, dest="input_t")
+    rec.add_argument("--output", "-o", type=int, dest="output_t")
     rec.add_argument("--total", type=int, default=None, help="defaults to input + output")
     rec.add_argument("--cached", type=int, default=0, help="cached input tokens")
     rec.add_argument("--turns", type=int, default=1)
@@ -67,6 +76,26 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if command == "record":
         task_class = args.task_class or classify_task(args.desc)
+
+        if args.from_response:
+            raw = sys.stdin.read() if args.from_response == "-" else _read(args.from_response)
+            entry = record_from_response(
+                json.loads(raw),
+                task_class=task_class,
+                task_desc=args.desc,
+                tier=args.tier,
+                success=not args.failed,
+                turns=args.turns,
+                profile=args.profile,
+            )
+            print(json.dumps(entry, indent=2))
+            return 0
+
+        if args.input_t is None or args.output_t is None:
+            print("error: --input and --output are required without --from-response",
+                  file=sys.stderr)
+            return 2
+
         entry = record_run(
             task_class,
             input_t=args.input_t,
